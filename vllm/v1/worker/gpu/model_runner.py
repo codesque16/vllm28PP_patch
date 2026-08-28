@@ -243,13 +243,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
-                # Drafting may require auxiliary hidden states from target model outputs
-                self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
-                    raise ValueError(
-                        f"{self.speculative_config.method} with pipeline parallel "
-                        "is not supported."
-                    )
+                # Drafting may require auxiliary hidden states from target model
+                # outputs. DSpark + PP: speculator is last-rank only, so capture
+                # aux hidden only there. Earlier ranks must still return
+                # IntermediateTensors for the PP send (not a (hidden, aux) tuple).
+                if self.speculative_config.method == "dspark" and self.use_pp:
+                    self.use_aux_hidden_state_outputs = self.is_last_pp_rank
+                else:
+                    self.use_aux_hidden_state_outputs = True
+                    if self.use_pp:
+                        raise ValueError(
+                            f"{self.speculative_config.method} with pipeline parallel "
+                            "is not supported."
+                        )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -368,6 +374,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                holder = getattr(self.model, "model", self.model)
+                logger.info(
+                    "Spec decode aux hidden: method=%s rejection=%s "
+                    "draft_sample=%s configured_layers=%s "
+                    "pp_start_layer=%s pp_end_layer=%s is_last_pp_rank=%s",
+                    self.speculative_config.method,
+                    getattr(
+                        self.speculative_config, "rejection_sample_method", None
+                    ),
+                    getattr(self.speculative_config, "draft_sample_method", None),
+                    getattr(holder, "aux_hidden_state_layers", None),
+                    getattr(holder, "start_layer", None),
+                    getattr(holder, "end_layer", None),
+                    self.is_last_pp_rank,
+                )
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)

@@ -16,6 +16,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -343,6 +344,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 )
                 name = name.removesuffix(".scale") + suffix
 
+            if "embed_tokens" in name and name not in params_dict:
+                continue
+
             # Expert weights
             if ".experts." in name:
                 if (
@@ -406,15 +410,41 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_params.add(name)
 
         self._finalize_moe()
-        logger.info_once("DSpark XPU draft model loaded: %d params", len(loaded_params))
+        embed_loaded = "model.embed_tokens.weight" in loaded_params
+        if get_pp_group().world_size > 1 and not embed_loaded:
+            raise RuntimeError(
+                "DSpark with pipeline parallelism must load embed_tokens from "
+                "the checkpoint: last-rank target embeddings are PPMissingLayer, "
+                "so they cannot be aliased. Random draft embeddings yield 0% "
+                "token acceptance."
+            )
+        logger.info_once(
+            "DSpark XPU draft model loaded: %d params%s",
+            len(loaded_params),
+            " (including last-rank embed_tokens)" if embed_loaded else "",
+        )
         return loaded_params
 
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:
             layer.ffn.finalize_mega_moe_weights()
 
+    def _remap_embed_name(self, name: str) -> str | None:
+        """Map target embedding checkpoint keys into the last-rank drafter."""
+        if get_pp_group().world_size <= 1:
+            return None
+        key = name[6:] if name.startswith("model.") else name
+        if key.startswith("embed_tokens."):
+            return f"model.{key}"
+        if key.startswith("embed."):
+            return f"model.embed_tokens.{key[len('embed.') :]}"
+        return None
+
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map checkpoint ``mtp.{i}.*`` name to this model's parameter path."""
+        embed = self._remap_embed_name(name)
+        if embed is not None:
+            return embed
         m = re.match(r"mtp\.(\d+)\.(.*)", name)
         if m is None:
             return None

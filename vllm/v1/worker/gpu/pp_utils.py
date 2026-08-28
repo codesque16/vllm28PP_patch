@@ -167,6 +167,23 @@ class PPHandler:
         )
         return bool(need_sampled_mask.all())
 
+    def _pad_sampled_token_ids(self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
+        """Match `receive()`'s `[num_reqs, max_sample_len]` payload.
+
+        The regular sampler emits `[num_reqs, 1]` on a no-draft (prefill) step.
+        Non-last ranks always recv `[num_reqs, num_speculative_steps + 1]`.
+        Broadcasting the raw sampler tensor deadlocks NCCL under spec+PP.
+        """
+        if sampled_token_ids.ndim == 1:
+            sampled_token_ids = sampled_token_ids.unsqueeze(-1)
+        num_reqs, sample_len = sampled_token_ids.shape
+        if sample_len == self.max_sample_len:
+            return sampled_token_ids.contiguous()
+        padded = sampled_token_ids.new_zeros(num_reqs, self.max_sample_len)
+        copy_len = min(sample_len, self.max_sample_len)
+        padded[:, :copy_len].copy_(sampled_token_ids[:, :copy_len])
+        return padded
+
     def broadcast(
         self,
         sampled_token_ids: torch.Tensor,
@@ -180,6 +197,7 @@ class PPHandler:
             return
 
         assert sampled_token_ids.dtype == torch.int64
+        sampled_token_ids = self._pad_sampled_token_ids(sampled_token_ids)
 
         if current_platform.is_xpu():
             self.main_stream.synchronize()
@@ -187,7 +205,7 @@ class PPHandler:
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(
-                sampled_token_ids.contiguous(),
+                sampled_token_ids,
                 src=self.last_rank,
                 group=self.broadcast_group,
             )
@@ -197,3 +215,7 @@ class PPHandler:
             )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
+        # Last rank must not start drafter NCCL / the next PP recv until this
+        # collective finishes. Overlapping those groups with an unmatched
+        # pp_broadcast deadlocks (seen in DSpark+PP mixed warmup).
+        self.main_stream.wait_stream(self.broadcast_stream)

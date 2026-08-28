@@ -1379,7 +1379,10 @@ class SpeculativeConfig:
                 "are only valid with rejection_sample_method='synthetic'."
             )
 
-        if self.draft_model_config:
+        # DSpark's draft is DeepSeekV4MTP, which does not implement SupportsPP.
+        # The target DeepseekV4ForCausalLM does; the speculator is last-PP-rank
+        # only. Skip this check so PP>1 + method=dspark can load.
+        if self.draft_model_config and self.method != "dspark":
             self.draft_model_config.verify_with_parallel_config(
                 self.draft_parallel_config
             )
