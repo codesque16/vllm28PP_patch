@@ -5,11 +5,14 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
 )
+
+logger = init_logger(__name__)
 
 
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -60,8 +63,10 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_inner = target_language_model.model
     draft_inner = draft_model.model
 
-    # Skip embedding sharing under PP — each rank owns its own embedding
-    # (same as Eagle). Drafter only runs on the last PP rank.
+    # PP=1: alias the target embedding table (mtp checkpoints have no embed).
+    # PP>1: last-rank target embed_tokens is PPMissingLayer (real table is on
+    # rank 0), so aliasing would leave the drafter with random embeddings and
+    # ~0% acceptance. load_weights loads embed.weight into the draft instead.
     if get_pp_group().world_size == 1:
         target_embed = getattr(target_inner, "embed_tokens", None)
         draft_embed = getattr(draft_inner, "embed_tokens", None)
@@ -71,6 +76,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if draft_embed is not None:
                 del draft_inner.embed_tokens
             draft_inner.embed_tokens = target_embed
+    else:
+        logger.info(
+            "DSpark PP=%d: last rank cannot alias target embed_tokens; "
+            "draft load_weights will read the checkpoint embedding table.",
+            get_pp_group().world_size,
+        )
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(draft_model, "lm_head", None)

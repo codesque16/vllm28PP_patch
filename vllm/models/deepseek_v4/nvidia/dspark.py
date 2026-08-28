@@ -18,6 +18,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -300,8 +301,9 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
-    # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
-    # load_dspark_model always aliases the target's.
+    # Draft weights ship in the target checkpoint as ``mtp.*``. ``lm_head`` is
+    # aliased from the last-rank target. ``embed_tokens`` is aliased only when
+    # PP=1; under PP the last rank loads the target embedding table itself.
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
@@ -388,8 +390,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
 
-        Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+        ``lm_head`` is aliased from the target on the last PP rank. ``embed_tokens``
+        is aliased only when PP=1; under PP>1 this loader also reads the target
+        embedding table because rank 0 owns it and last-rank cannot alias
+        ``PPMissingLayer``.
         """
         first_layer = self.model.layers[0]
         use_mega_moe = first_layer.ffn.use_mega_moe
@@ -445,6 +449,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     else ".weight_scale_inv"
                 )
                 name = name.removesuffix(".scale") + suffix
+            # Unquantized draft embed has no scale params; skip extras.
+            if "embed_tokens" in name and name not in params_dict:
+                continue
             if ".shared_experts.w2" in name:
                 name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
             if self.pad_shared_expert and ".shared_experts." in name:
@@ -507,18 +514,49 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self._finalize_moe()
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
-        logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
+        embed_loaded = "model.embed_tokens.weight" in loaded_params
+        if get_pp_group().world_size > 1 and not embed_loaded:
+            raise RuntimeError(
+                "DSpark with pipeline parallelism must load embed_tokens from "
+                "the checkpoint: last-rank target embeddings are PPMissingLayer, "
+                "so they cannot be aliased. Random draft embeddings yield 0% "
+                "token acceptance."
+            )
+        logger.info_once(
+            "DSpark draft model loaded: %d params%s",
+            len(loaded_params),
+            " (including last-rank embed_tokens)" if embed_loaded else "",
+        )
         return loaded_params
 
     def _finalize_moe(self) -> None:
         for layer in self.model.layers:
             layer.ffn.finalize_mega_moe_weights()
 
+    def _remap_embed_name(self, name: str) -> str | None:
+        """Map target embedding checkpoint keys into the last-rank drafter.
+
+        Check ``embed_tokens.`` before ``embed.``: the latter is a prefix of the
+        former.
+        """
+        if get_pp_group().world_size <= 1:
+            return None
+        key = name[6:] if name.startswith("model.") else name
+        if key.startswith("embed_tokens."):
+            return f"model.{key}"
+        if key.startswith("embed."):
+            return f"model.embed_tokens.{key[len('embed.') :]}"
+        return None
+
     def _remap_dspark_name(self, name: str) -> str | None:
         """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
 
-        Returns None for non-mtp weights (owned by the target model).
+        Returns None for non-mtp weights (owned by the target model), except
+        the target embedding table under PP>1 (see ``_remap_embed_name``).
         """
+        embed = self._remap_embed_name(name)
+        if embed is not None:
+            return embed
         m = re.match(r"mtp\.(\d+)\.(.*)", name)
         if m is None:
             return None
