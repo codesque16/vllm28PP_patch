@@ -1845,6 +1845,145 @@ def generate_scheduler_kv_cache_config(
     return cfg
 
 
+def _kv_spec_label(spec: KVCacheSpec) -> str:
+    """Short human-readable type + window/compress fields for capacity logs."""
+    name = type(spec).__name__
+    extra: list[str] = []
+    if isinstance(spec, SlidingWindowSpec):
+        extra.append(f"window={spec.sliding_window}")
+        if spec.extra_retained_tokens:
+            extra.append(f"extra_retained={spec.extra_retained_tokens}")
+    if isinstance(spec, SlidingWindowMLASpec):
+        extra.append(f"compress={spec.compress_ratio}")
+    if isinstance(spec, ChunkedLocalAttentionSpec):
+        extra.append(f"chunk={spec.attention_chunk_size}")
+    if isinstance(spec, MLAAttentionSpec):
+        extra.append(f"compress={spec.compress_ratio}")
+        if spec.cache_dtype_str:
+            extra.append(spec.cache_dtype_str)
+    if isinstance(spec, AttentionSpec):
+        extra.append(f"block={spec.block_size}")
+        extra.append(f"page={spec.page_size_bytes}B")
+    return name + (f" ({', '.join(extra)})" if extra else "")
+
+
+def _log_kv_cache_capacity_breakdown(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    num_tokens: int,
+    max_concurrency: float,
+) -> None:
+    """Explain the printed GPU KV cache size for hybrid models (DeepSeek-V4).
+
+    The public line is ``concurrency * max_model_len``. That is NOT
+    ``available_bytes / bytes_per_token`` when some groups are sliding-window
+    (per-request hold is a small window, not the full max_model_len).
+    """
+    max_model_len = vllm_config.model_config.max_model_len
+    block_size = vllm_config.cache_config.block_size
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    num_blocks = kv_cache_config.num_blocks
+
+    logger.info_once(
+        "KV cache capacity math: max_model_len=%s  block_size=%s  "
+        "max_num_seqs=%s  pool_num_blocks=%s",
+        f"{max_model_len:,}",
+        block_size,
+        max_num_seqs,
+        f"{num_blocks:,}",
+    )
+
+    blocks_per_req_total = 0
+    for gi, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        n_layers = len(group.layer_names)
+        page = spec.page_size_bytes
+        mem = spec.max_memory_usage_bytes(vllm_config)
+        blocks = cdiv(mem, page) if page else 0
+        blocks_per_req_total += blocks
+        logger.info_once(
+            "  KV group[%s]: %s layers  spec=%s  "
+            "page=%s B  one_req_at_max_len=%s B (%s)  "
+            "blocks_per_request=cdiv(%s, %s)=%s",
+            gi,
+            n_layers,
+            _kv_spec_label(spec),
+            f"{page:,}",
+            f"{mem:,}",
+            format_gib(mem),
+            f"{mem:,}",
+            f"{page:,}",
+            f"{blocks:,}",
+        )
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            # DeepSeek-V4 packed groups: inner layers can mix page sizes.
+            by_type: dict[str, int] = {}
+            for inner in spec.kv_cache_specs.values():
+                key = _kv_spec_label(inner)
+                by_type[key] = by_type.get(key, 0) + 1
+            inner_pages = spec.max_memory_usage_pages(vllm_config)
+            logger.info_once(
+                "    UniformType inner: %s  "
+                "max_memory_usage_pages(max_model_len)=%s  "
+                "page_size_bytes=sum(inner)=%s B",
+                ", ".join(f"{k} x{v}" for k, v in by_type.items()),
+                f"{inner_pages:,}",
+                f"{spec.page_size_bytes:,}",
+            )
+
+    if blocks_per_req_total <= 0:
+        logger.info_once("  KV groups have zero blocks_per_request; skip rest of math")
+        return
+
+    # Linear vs window split: Full/MLA scale with max_model_len; SWA does not.
+    linear_blocks = 0
+    window_blocks = 0
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        blocks = cdiv(
+            spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+        )
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            # Classify by majority inner type.
+            inners = list(spec.kv_cache_specs.values())
+            if inners and all(isinstance(s, SlidingWindowSpec) for s in inners):
+                window_blocks += blocks
+            else:
+                linear_blocks += blocks
+        elif isinstance(spec, SlidingWindowSpec):
+            window_blocks += blocks
+        else:
+            linear_blocks += blocks
+
+    logger.info_once(
+        "  blocks_per_request total=%s  "
+        "(approx linear/full=%s  sliding_window=%s)",
+        f"{blocks_per_req_total:,}",
+        f"{linear_blocks:,}",
+        f"{window_blocks:,}",
+    )
+    logger.info_once(
+        "  max_concurrency = pool_num_blocks / blocks_per_request "
+        "= %s / %s = %.4f",
+        f"{num_blocks:,}",
+        f"{blocks_per_req_total:,}",
+        max_concurrency,
+    )
+    logger.info_once(
+        "  printed GPU KV cache size = max_concurrency * max_model_len "
+        "= %.4f * %s = %s tokens",
+        max_concurrency,
+        f"{max_model_len:,}",
+        f"{num_tokens:,}",
+    )
+    logger.info_once(
+        "  This printed token count is NOT leftover_GiB / bytes_per_token. "
+        "Sliding-window / compressor / indexer groups charge a small per-request "
+        "window even when max_model_len is 1M, so raising max_model_len inflates "
+        "the printed size far more than the 40GiB pool."
+    )
+
+
 def get_kv_cache_capacity(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> tuple[int, float]:
@@ -1872,6 +2011,9 @@ def update_kv_cache_capacity(
         f"{num_tokens:,}",
         f"{max_model_len:,}",
         max_concurrency,
+    )
+    _log_kv_cache_capacity_breakdown(
+        vllm_config, kv_cache_config, num_tokens, max_concurrency
     )
 
 

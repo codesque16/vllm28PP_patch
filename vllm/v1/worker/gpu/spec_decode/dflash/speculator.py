@@ -340,6 +340,28 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
+        if not getattr(self, "_logged_propose_aux", False):
+            self._logged_propose_aux = True
+            aux_shapes = (
+                None
+                if not aux_hidden_states
+                else [tuple(t.shape) for t in aux_hidden_states]
+            )
+            logger.info(
+                "%s propose: using_aux=%s aux_shapes=%s last_hidden=%s "
+                "(empty aux falls back to last target hidden — DSpark "
+                "drafts will not match and acceptance goes to 0)",
+                self._speculator_name,
+                bool(aux_hidden_states),
+                aux_shapes,
+                tuple(last_hidden_states.shape),
+            )
+            if not aux_hidden_states:
+                logger.warning(
+                    "%s got no aux hidden states; drafts will be garbage "
+                    "under --no-synthetic (mean acceptance length ~1.0)",
+                    self._speculator_name,
+                )
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
                 torch.cat(aux_hidden_states, dim=-1)

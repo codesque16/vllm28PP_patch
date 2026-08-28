@@ -374,6 +374,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                holder = getattr(self.model, "model", self.model)
+                logger.info(
+                    "Spec decode aux hidden: method=%s rejection=%s "
+                    "draft_sample=%s configured_layers=%s "
+                    "pp_start_layer=%s pp_end_layer=%s is_last_pp_rank=%s",
+                    self.speculative_config.method,
+                    getattr(
+                        self.speculative_config, "rejection_sample_method", None
+                    ),
+                    getattr(self.speculative_config, "draft_sample_method", None),
+                    getattr(holder, "aux_hidden_state_layers", None),
+                    getattr(holder, "start_layer", None),
+                    getattr(holder, "end_layer", None),
+                    self.is_last_pp_rank,
+                )
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
