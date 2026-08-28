@@ -1085,9 +1085,14 @@ def rejection_sample(
         local_residual_mass = None
 
     # Sample up until the first rejected/bonus token, and store
-    # the step.
-    sampled = draft_sampled.new_empty(
-        num_reqs, num_speculative_steps + 1, dtype=torch.int64
+    # the step. Zero-fill: unused columns are broadcast over PP as
+    # [num_reqs, num_spec+1]. new_empty garbage (or leftover 0=BOS)
+    # must not look like real tokens if num_sampled is over-read.
+    sampled = torch.zeros(
+        num_reqs,
+        num_speculative_steps + 1,
+        dtype=torch.int64,
+        device=draft_sampled.device,
     )
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)

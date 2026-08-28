@@ -5,15 +5,23 @@ import torch
 
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
 class DraftTokensHandler:
-    def __init__(self, device: torch.device | None = None):
+    def __init__(
+        self,
+        device: torch.device | None = None,
+        copy_to_scheduler: bool = False,
+    ):
         self.device = device
         self.copy_stream = torch.cuda.Stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
+        # PP>1: earlier ranks embed draft ids, so the scheduler must see the
+        # real tokens (not [-1] placeholders) and send them in SchedulerOutput.
+        self.copy_to_scheduler = copy_to_scheduler
 
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
@@ -24,7 +32,7 @@ class DraftTokensHandler:
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
+        if not input_batch.has_structured_output_reqs and not self.copy_to_scheduler:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
             self.draft_tokens_np = None
@@ -50,6 +58,35 @@ class DraftTokensHandler:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
+
+
+def copy_scheduled_draft_tokens_to_gpu(
+    draft_token_buf: torch.Tensor,
+    req_ids: list[str],
+    idx_mapping: torch.Tensor,
+    scheduled_drafts: dict[str, list[int]],
+    device: torch.device,
+) -> None:
+    """Scatter scheduler draft ids into the GPU buffer used by combine().
+
+    Under PP the embedder (rank 0) never runs propose(), so leftover GPU
+    drafts stay zeros unless we copy the ids from SchedulerOutput.
+    """
+    n_spec = draft_token_buf.shape[-1]
+    packed = np.zeros((len(req_ids), n_spec), dtype=np.int64)
+    any_real = False
+    for i, req_id in enumerate(req_ids):
+        toks = scheduled_drafts.get(req_id) or ()
+        if not toks:
+            continue
+        n = min(len(toks), n_spec)
+        packed[i, :n] = toks[:n]
+        if not any_real:
+            any_real = any(t >= 0 for t in toks[:n])
+    if not any_real:
+        return
+    gpu_packed = async_copy_to_gpu(packed, device=device)
+    draft_token_buf[idx_mapping] = gpu_packed
 
 
 def get_parallel_drafting_token_id(hf_config) -> int:

@@ -141,7 +141,10 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     get_max_chunk_logits,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+from vllm.v1.worker.gpu.spec_decode.utils import (
+    DraftTokensHandler,
+    copy_scheduled_draft_tokens_to_gpu,
+)
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -258,7 +261,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         )
 
         # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        # PP>1 also copies real draft ids to the scheduler so earlier ranks
+        # can embed them (propose() runs on the last rank only).
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device, copy_to_scheduler=self.use_pp
+        )
 
         self.pcp_manager: pcp.PCPManager | None = None
 
@@ -1245,6 +1252,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+
+        if draft_tokens and self.use_pp:
+            copy_scheduled_draft_tokens_to_gpu(
+                self.req_states.draft_tokens,
+                req_ids,
+                idx_mapping,
+                draft_tokens,
+                self.device,
+            )
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.

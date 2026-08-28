@@ -116,6 +116,10 @@ class PPHandler:
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
+        # Omit query_start_loc: non-last ranks already added query_len in
+        # postprocess_num_computed_tokens. Delayed post_update then applies
+        # computed_delta = 0 - num_rejected, matching last rank's
+        # query_len - num_rejected.
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
