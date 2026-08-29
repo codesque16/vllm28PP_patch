@@ -94,6 +94,9 @@ class PPHandler:
         # True iff this step posted the sampled-token collectives. Draft-token
         # broadcast/recv must follow the same skip so NCCL stays matched.
         self._did_token_broadcast = False
+        # Stable clone of the last-rank draft send payload while NCCL is in
+        # flight. Cleared when the next sampled collective drains the stream.
+        self._inflight_draft_send: torch.Tensor | None = None
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -217,6 +220,10 @@ class PPHandler:
         self._did_token_broadcast = False
         if compute_need_sampled_mask(input_batch) is None:
             # No request needs sampled outputs for a subsequent decode step.
+            # Still retire a leftover draft send so the clone can be freed.
+            if self._inflight_draft_send is not None:
+                self.main_stream.wait_stream(self.broadcast_stream)
+                self._inflight_draft_send = None
             return
 
         assert sampled_token_ids.dtype == torch.int64
@@ -241,7 +248,10 @@ class PPHandler:
         # Last rank must not start drafter NCCL / the next PP recv until this
         # collective finishes. Overlapping those groups with an unmatched
         # pp_broadcast deadlocks (seen in DSpark+PP mixed warmup).
+        # Also retires a leftover async draft send from the previous step
+        # (same stream, posted after that step's sampled wait).
         self.main_stream.wait_stream(self.broadcast_stream)
+        self._inflight_draft_send = None
         self._did_token_broadcast = True
 
     def _pad_draft_token_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
@@ -272,6 +282,11 @@ class PPHandler:
             return
         assert draft_token_ids.dtype == torch.int64
         draft_token_ids = self._pad_draft_token_ids(draft_token_ids)
+        # Clone: next execute_model may zero `req_states.draft_tokens` on slot
+        # reuse, and the next propose() overwrites the persistent buffer.
+        # NCCL must read a stable copy while it overlaps that step.
+        send_buf = draft_token_ids.clone()
+        self._inflight_draft_send = send_buf
 
         if current_platform.is_xpu():
             self.main_stream.synchronize()
@@ -279,12 +294,16 @@ class PPHandler:
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             torch.distributed.broadcast(
-                draft_token_ids,
+                send_buf,
                 src=self.last_rank,
                 group=self.broadcast_group,
             )
-            draft_token_ids.record_stream(self.broadcast_stream)
-        self.main_stream.wait_stream(self.broadcast_stream)
+            send_buf.record_stream(self.broadcast_stream)
+        # Do not wait here. The next last-rank sampled `broadcast()` already
+        # ends with main_stream.wait_stream(broadcast_stream), after the next
+        # execute_model, so this collective overlaps compute. Do not wait in
+        # receive() either: that collapsed the PP sampled-token FIFO and
+        # dropped synthetic tok/s from ~2000 to ~1400.
 
     def receive_draft_tokens(self, input_batch: InputBatch) -> None:
         """Recv last-rank draft ids into this step's FIFO slot.
