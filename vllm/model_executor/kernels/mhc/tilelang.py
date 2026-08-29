@@ -515,7 +515,12 @@ def mhc_fused_post_pre_tilelang(
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
     use_deep_gemm = is_deep_gemm_supported()
-    use_small_fma = num_tokens <= 16
+    # Hopper small-batch fused FMA uses split-K 4/8. On SM120 that
+    # corrupts last-token MHC state (CJK first sample / decode loops).
+    # Spec sequential is exactly 8 tokens (1+7 drafts) and hit n_splits=4;
+    # skip this path on Blackwell and use DeepGEMM with n_splits=1.
+    sm120 = torch.cuda.get_device_capability(0)[0] >= 12
+    use_small_fma = num_tokens <= 16 and not sm120
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3

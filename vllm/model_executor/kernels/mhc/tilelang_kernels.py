@@ -19,12 +19,19 @@ ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda
 def compute_num_split(block_k: int, k: int | None, grid_size: int) -> int:
     device_props = torch.cuda.get_device_properties(0)
     n_sms = device_props.multi_processor_count
-    split_k = n_sms // grid_size
+    split_k = n_sms // max(grid_size, 1)
     if k is not None:
         # avoid split_k for small k
         num_block_k = cdiv(k, block_k)
         split_k = min(split_k, num_block_k // 4)
     split_k = max(split_k, 1)
+    # SM120 hc_prenorm split-K corrupts last-token MHC state (CJK first
+    # sample) when occupancy yields 31/32/18/... . Hopper SM90 is fine.
+    # Disable split-K on Blackwell; one CTA covers K. Hopper still floors
+    # to a power of two so 256 K-blocks tile evenly if occupancy is odd.
+    if torch.cuda.get_device_capability(0)[0] >= 12:
+        return 1
+    split_k = 1 << (split_k.bit_length() - 1)
     return split_k
 
 
