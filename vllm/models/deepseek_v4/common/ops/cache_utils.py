@@ -503,9 +503,11 @@ def _compute_global_topk_indices_and_lens_kernel(
             mask=mask,
             other=-1,
         )
-        is_valid = local_idx >= 0
-
+        # #49896: NaN-broken top-k emits 0x7FC00000 / uninitialized smem as
+        # indices. Treat those as padding instead of gathering OOB block ids
+        # (the IMA that kills Worker_PP* on long C4A prefill).
         block_indices = local_idx // block_size
+        is_valid = (local_idx >= 0) & (block_indices < block_table_stride)
         block_numbers = tl.load(
             block_table_ptr + req_idx * block_table_stride + block_indices,
             mask=mask & is_valid,
