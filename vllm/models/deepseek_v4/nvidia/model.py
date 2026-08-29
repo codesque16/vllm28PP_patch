@@ -1113,15 +1113,33 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         dtype: torch.dtype,
         device: torch.device,
     ) -> IntermediateTensors:
-        # PP intermediate tensors carry the multi-stream hidden_states
-        # of shape (num_tokens, hc_mult, hidden_size) — V4 expands the
-        # token embedding to hc_mult streams before the first decoder
-        # layer and keeps that shape until hc_head() collapses it.
+        # MHC defers each sublayer's post to the next sublayer's fused
+        # post-pre. Across a PP cut we must ship that deferred state, not a
+        # reconstructed hidden that the next rank would mhc_pre from scratch.
+        # hidden_states is the last FFN output (T, H); residual/post_mix/
+        # res_mix are the carried MHC mixer tensors.
+        hc_mult = self.hc_mult
+        hidden_size = self.config.hidden_size
         return IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
+                    (batch_size, hidden_size),
                     dtype=dtype,
+                    device=device,
+                ),
+                "residual": torch.zeros(
+                    (batch_size, hc_mult, hidden_size),
+                    dtype=dtype,
+                    device=device,
+                ),
+                "post_mix": torch.zeros(
+                    (batch_size, hc_mult, 1),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "res_mix": torch.zeros(
+                    (batch_size, hc_mult, hc_mult),
+                    dtype=torch.float32,
                     device=device,
                 ),
             }
@@ -1139,9 +1157,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            residual, post_mix, res_mix = None, None, None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+            post_mix = intermediate_tensors["post_mix"]
+            res_mix = intermediate_tensors["res_mix"]
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -1156,7 +1178,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
 
-        residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
         for idx, layer in enumerate(
@@ -1181,6 +1202,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
+
+        # Do not mhc_post at a PP boundary. The next rank's first layer
+        # continues with fused post-pre on the FFN output + mixer state.
+        if not get_pp_group().is_last_rank:
+            assert residual is not None and post_mix is not None and res_mix is not None
+            return IntermediateTensors(
+                {
+                    "hidden_states": hidden_states.contiguous(),
+                    "residual": residual.contiguous(),
+                    "post_mix": post_mix.contiguous(),
+                    "res_mix": res_mix.contiguous(),
+                }
+            )
+
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
@@ -1189,9 +1224,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = mhc_post_tilelang(
                     hidden_states, residual, post_mix, res_mix
                 )
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
 
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
