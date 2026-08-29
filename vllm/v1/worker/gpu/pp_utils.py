@@ -30,6 +30,9 @@ class PendingRecv:
     # Snapshot of slot generation counters at receive time, used to
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
+    # Spec+PP: new draft ids proposed at step T. Applied with the bonus
+    # token at T+pp_size. None when this step had no draft collective.
+    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_spec]
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -73,6 +76,8 @@ class PPHandler:
         # pushed by step T's `receive` is consumed pp_size steps later. Pre-seeded
         # with pp_size None placeholders so the first pp_size consumes are no-ops.
         # None means no postprocess is pending for that step (broadcast skipped).
+        # Spec+PP stores bonus + k draft ids in the same slot; both are applied
+        # at T+pp_size when the scheduler next runs that request.
         self.queue: deque[PendingRecv | None] = (
             deque() if self.is_last_rank else deque([None] * get_pp_group().world_size)
         )
@@ -86,6 +91,9 @@ class PPHandler:
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
+        # True iff this step posted the sampled-token collectives. Draft-token
+        # broadcast/recv must follow the same skip so NCCL stays matched.
+        self._did_token_broadcast = False
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -116,17 +124,29 @@ class PPHandler:
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
-        return dict(
+        outputs: dict[str, torch.Tensor] = dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
         )
+        if slot.draft_tokens is not None:
+            if exclude_mask.any():
+                keep = torch.from_numpy(np.ascontiguousarray(~exclude_mask)).to(
+                    device=self.device, non_blocking=True
+                )
+                outputs["draft_tokens"] = slot.draft_tokens[keep]
+                outputs["draft_idx_mapping"] = slot.idx_mapping[keep]
+            else:
+                outputs["draft_tokens"] = slot.draft_tokens
+                outputs["draft_idx_mapping"] = slot.idx_mapping
+        return outputs
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
         requests in the batch."""
         assert not self.is_last_rank
+        self._did_token_broadcast = False
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
@@ -155,7 +175,7 @@ class PPHandler:
             # later used on the main stream.
             sampled_tokens.record_stream(self.main_stream)
             combined.record_stream(self.main_stream)
-        self.queue[-1] = PendingRecv(
+        slot = PendingRecv(
             event,
             sampled_tokens,
             num_sampled,
@@ -165,6 +185,8 @@ class PPHandler:
             need_sampled_mask,
             gen_at_receive_np,
         )
+        self.queue[-1] = slot
+        self._did_token_broadcast = True
         return bool(need_sampled_mask.all())
 
     def _pad_sampled_token_ids(self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
@@ -192,6 +214,7 @@ class PPHandler:
         input_batch: InputBatch,
     ) -> None:
         assert self.is_last_rank
+        self._did_token_broadcast = False
         if compute_need_sampled_mask(input_batch) is None:
             # No request needs sampled outputs for a subsequent decode step.
             return
@@ -219,3 +242,75 @@ class PPHandler:
         # collective finishes. Overlapping those groups with an unmatched
         # pp_broadcast deadlocks (seen in DSpark+PP mixed warmup).
         self.main_stream.wait_stream(self.broadcast_stream)
+        self._did_token_broadcast = True
+
+    def _pad_draft_token_ids(self, draft_token_ids: torch.Tensor) -> torch.Tensor:
+        """Match `receive_draft_tokens()`'s `[num_reqs, num_spec]` payload."""
+        num_spec = self.max_sample_len - 1
+        if draft_token_ids.ndim == 1:
+            draft_token_ids = draft_token_ids.unsqueeze(-1)
+        num_reqs, spec_len = draft_token_ids.shape
+        if spec_len == num_spec:
+            return draft_token_ids.contiguous()
+        padded = draft_token_ids.new_zeros(num_reqs, num_spec)
+        copy_len = min(spec_len, num_spec)
+        padded[:, :copy_len].copy_(draft_token_ids[:, :copy_len])
+        return padded
+
+    def broadcast_draft_tokens(
+        self, draft_token_ids: torch.Tensor, input_batch: InputBatch
+    ) -> None:
+        """Send this step's proposed draft ids to earlier PP ranks.
+
+        Rank 0 embeds; `propose()` only runs on the last rank. Same communicator
+        as sampled tokens, but a separate collective after `propose()` (drafts
+        do not exist yet when `broadcast()` runs). Earlier ranks store the ids
+        in the same FIFO slot as the bonus token and apply both at T+pp_size.
+        """
+        assert self.is_last_rank
+        if not self._did_token_broadcast or self.max_sample_len <= 1:
+            return
+        assert draft_token_ids.dtype == torch.int64
+        draft_token_ids = self._pad_draft_token_ids(draft_token_ids)
+
+        if current_platform.is_xpu():
+            self.main_stream.synchronize()
+
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            torch.distributed.broadcast(
+                draft_token_ids,
+                src=self.last_rank,
+                group=self.broadcast_group,
+            )
+            draft_token_ids.record_stream(self.broadcast_stream)
+        self.main_stream.wait_stream(self.broadcast_stream)
+
+    def receive_draft_tokens(self, input_batch: InputBatch) -> None:
+        """Recv last-rank draft ids into this step's FIFO slot.
+
+        Must run in the same `sample_tokens` RPC as `broadcast_draft_tokens`.
+        Does not wait on the main stream; `get_prev_sampled_outputs` waits
+        at T+pp_size, matching the sampled-token FIFO.
+        """
+        assert not self.is_last_rank
+        if not self._did_token_broadcast or self.max_sample_len <= 1:
+            return
+
+        slot = self.queue[-1]
+        assert slot is not None, "draft recv requires the sampled-token FIFO slot"
+
+        num_spec = self.max_sample_len - 1
+        num_reqs = input_batch.num_reqs
+        with torch.cuda.stream(self.broadcast_stream):
+            buf = torch.empty(
+                num_reqs, num_spec, dtype=torch.int64, device=self.device
+            )
+            torch.distributed.broadcast(
+                buf, src=self.last_rank, group=self.broadcast_group
+            )
+            event = self.broadcast_stream.record_event()
+            buf.record_stream(self.main_stream)
+        slot.draft_tokens = buf
+        # Same stream as the sampled recv, so this event covers both.
+        slot.event = event

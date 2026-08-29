@@ -966,12 +966,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
     def update_pp_decode_requests(self):
-        # For non-last PP ranks, update decode requests with sampler output from
-        # the prior step in which they were scheduled (pp_size steps ago).
+        # Non-last PP ranks: sampler (+ draft) output from pp_size steps ago.
         if self.pp_handler is not None:
             outputs = self.pp_handler.get_prev_sampled_outputs()
             if outputs is not None:
+                draft_tokens = outputs.pop("draft_tokens", None)
+                draft_idx_mapping = outputs.pop("draft_idx_mapping", None)
                 self.postprocess_sampled(**outputs)
+                if draft_tokens is not None:
+                    assert draft_idx_mapping is not None
+                    self.req_states.draft_tokens[draft_idx_mapping] = draft_tokens
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         for new_req_data in scheduler_output.scheduled_new_reqs:
@@ -1748,6 +1752,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
             all_decode_next = self.pp_handler.receive(input_batch)
+            if self.num_speculative_steps > 0:
+                # Post draft recv into the same FIFO slot as the bonus token.
+                # Both are applied at T+pp_size in update_pp_decode_requests.
+                self.pp_handler.receive_draft_tokens(input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
             self.postprocess_num_computed_tokens(input_batch)
@@ -1865,6 +1873,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
+
+        if self.pp_handler is not None and self.num_speculative_steps > 0:
+            # After propose(): send draft ids on pp_broadcast so earlier ranks
+            # can store them in the T+pp_size FIFO slot with the bonus token.
+            # Must follow the sampled broadcast skip (see PPHandler._did_token_broadcast).
+            self.pp_handler.broadcast_draft_tokens(
+                self.req_states.draft_tokens[input_batch.idx_mapping],
+                input_batch,
+            )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
