@@ -1,4 +1,5 @@
 bench_results/
+bench_data/
 startup_logs/
 __pycache__/
 *.pyc
